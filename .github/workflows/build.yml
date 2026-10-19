@@ -1,0 +1,579 @@
+name: Build Android APK and AAB
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_config:
+        description: 'Base64 encoded app_config.json'
+        required: true
+        type: string
+      keystore_base64:
+        description: 'Optional Base64 encoded release.keystore'
+        required: false
+        type: string
+      keystore_password:
+        description: 'Keystore password'
+        required: false
+        default: 'android'
+        type: string
+      key_alias:
+        description: 'Key alias'
+        required: false
+        default: 'androidkey'
+        type: string
+      key_password:
+        description: 'Key password'
+        required: false
+        default: 'android'
+        type: string
+
+jobs:
+  build:
+    name: Build & Sign Android App
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        continue-on-error: true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Accept Android SDK Licenses & Prepare SDK
+        run: |
+          ANDROID_PATH="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          mkdir -p "$ANDROID_PATH/licenses" || true
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n84831b9409646a297e70897e937d995642c67674\n893fb8a22d820c24a14dd3d97ec55b572ddfedd6\n" > "$ANDROID_PATH/licenses/android-sdk-license" || true
+          printf "84831b9409646a297e70897e937d995642c67674\n" > "$ANDROID_PATH/licenses/android-sdk-preview-license" || true
+          
+          SDKMANAGER=$(which sdkmanager 2>/dev/null || find "$ANDROID_PATH" -name sdkmanager -type f 2>/dev/null | head -n 1)
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses || true
+            "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" || true
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate Complete Android Kotlin Project
+        env:
+          CONFIG_B64: ${{ inputs.app_config }}
+        run: |
+          python3 - << 'EOF'
+          import json, base64, os, re
+
+          raw_b64 = os.environ.get("CONFIG_B64", "")
+          if not raw_b64:
+              raise ValueError("Missing CONFIG_B64 input")
+
+          config_json = base64.b64decode(raw_b64).decode("utf-8")
+          config = json.loads(config_json)
+
+          app_name = config.get("app_name", "My App")
+          raw_pkg = config.get("package_name", "com.template.app")
+          
+          # Sanitize package name into valid Java/Kotlin identifier
+          clean_pkg = re.sub(r'[^a-zA-Z0-9_.]', '_', str(raw_pkg))
+          clean_pkg = re.sub(r'\.+', '.', clean_pkg).strip('.')
+          segments = [('a' + s if s and s[0].isdigit() else s) for s in clean_pkg.split('.') if s]
+          if len(segments) < 2:
+              segments = ['com', 'app']
+          pkg_name = '.'.join(segments)
+
+          try:
+              v_code = int(config.get("version_code", 1) or 1)
+          except:
+              v_code = 1
+          v_name = str(config.get("version_name", "1.0.0") or "1.0.0")
+          
+          theme_color = str(config.get("theme_color", "#6366F1")).strip()
+          if not theme_color.startswith("#") or len(theme_color) not in [4, 7, 9]:
+              theme_color = "#6366F1"
+
+          website_url = config.get("website_url", "https://example.com")
+          if not website_url or not str(website_url).strip():
+              website_url = "https://example.com"
+          # Safely escape backslashes, quotes and dollar signs for Kotlin string interpolation
+          safe_url = str(website_url).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
+
+          perms = config.get("permissions", {})
+
+          project_dir = "android-project"
+          os.makedirs(f"{project_dir}/app/src/main/assets", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/values", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/layout", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/xml", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/drawable", exist_ok=True)
+          os.makedirs(f"{project_dir}/app/src/main/res/mipmap-anydpi-v26", exist_ok=True)
+
+          pkg_path = f"{project_dir}/app/src/main/java/" + pkg_name.replace(".", "/")
+          os.makedirs(pkg_path, exist_ok=True)
+
+          # local.properties pointing directly to ANDROID_HOME
+          android_home = os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk")
+          with open(f"{project_dir}/local.properties", "w") as f:
+              f.write(f"sdk.dir={android_home}\n")
+
+          # 1. Write app_config.json
+          with open(f"{project_dir}/app/src/main/assets/app_config.json", "w", encoding="utf-8") as f:
+              f.write(config_json)
+
+          # 2. settings.gradle.kts
+          safe_name = re.sub(r'[^a-zA-Z0-9]', '', app_name) or "WebsiteToApp"
+          with open(f"{project_dir}/settings.gradle.kts", "w") as f:
+              f.write(f'''pluginManagement {{
+      repositories {{
+          google()
+          mavenCentral()
+          gradlePluginPortal()
+      }}
+  }}
+  dependencyResolutionManagement {{
+      repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+      repositories {{
+          google()
+          mavenCentral()
+      }}
+  }}
+  rootProject.name = "{safe_name}"
+  include(":app")
+  ''')
+
+          # 3. Root build.gradle.kts
+          with open(f"{project_dir}/build.gradle.kts", "w") as f:
+              f.write('''plugins {
+      id("com.android.application") version "8.2.2" apply false
+      id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+  }
+  ''')
+
+          # 4. gradle.properties
+          with open(f"{project_dir}/gradle.properties", "w") as f:
+              f.write('''org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+  android.useAndroidX=true
+  android.enableJetifier=true
+  kotlin.code.style=official
+  android.nonTransitiveRClass=true
+  ''')
+
+          # 5. app/build.gradle.kts
+          with open(f"{project_dir}/app/build.gradle.kts", "w") as f:
+              f.write(f'''plugins {{
+      id("com.android.application")
+      id("org.jetbrains.kotlin.android")
+  }}
+
+  android {{
+      namespace = "{pkg_name}"
+      compileSdk = 34
+
+      defaultConfig {{
+          applicationId = "{pkg_name}"
+          minSdk = 24
+          targetSdk = 34
+          versionCode = {v_code}
+          versionName = "{v_name}"
+          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+          vectorDrawables {{
+              useSupportLibrary = true
+          }}
+      }}
+
+      signingConfigs {{
+          create("release") {{
+              val ks1 = file("release-keystore.jks")
+              val ks2 = file("../release-keystore.jks")
+              if (ks1.exists()) {{
+                  storeFile = ks1
+              }} else if (ks2.exists()) {{
+                  storeFile = ks2
+              }}
+              storePassword = (System.getenv("KEYSTORE_PASSWORD")?.takeIf {{ it.isNotBlank() }}) ?: "android"
+              keyAlias = (System.getenv("KEY_ALIAS")?.takeIf {{ it.isNotBlank() }}) ?: "androidkey"
+              keyPassword = (System.getenv("KEY_PASSWORD")?.takeIf {{ it.isNotBlank() }}) ?: "android"
+          }}
+      }}
+
+      buildTypes {{
+          release {{
+              isMinifyEnabled = false
+              val ks1 = file("release-keystore.jks")
+              val ks2 = file("../release-keystore.jks")
+              if (ks1.exists() || ks2.exists()) {{
+                  signingConfig = signingConfigs.getByName("release")
+              }}
+          }}
+          debug {{
+              isMinifyEnabled = false
+          }}
+      }}
+
+      compileOptions {{
+          sourceCompatibility = JavaVersion.VERSION_17
+          targetCompatibility = JavaVersion.VERSION_17
+      }}
+
+      kotlinOptions {{
+          jvmTarget = "17"
+      }}
+
+      lint {{
+          abortOnError = false
+          checkReleaseBuilds = false
+      }}
+  }}
+
+  dependencies {{
+      implementation("androidx.core:core-ktx:1.12.0")
+      implementation("androidx.appcompat:appcompat:1.6.1")
+      implementation("com.google.android.material:material:1.11.0")
+      implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+      implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
+      implementation("androidx.webkit:webkit:1.10.0")
+      implementation("com.google.code.gson:gson:2.10.1")
+  }}
+  ''')
+
+          # 6. AndroidManifest.xml
+          perm_tags = ['<uses-permission android:name="android.permission.INTERNET" />', '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />']
+          if perms.get("post_notifications"): perm_tags.append('<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />')
+          if perms.get("camera"): perm_tags.append('<uses-permission android:name="android.permission.CAMERA" />')
+          if perms.get("access_fine_location"):
+              perm_tags.append('<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />')
+              perm_tags.append('<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />')
+          if perms.get("read_external_storage"):
+              perm_tags.append('<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />')
+              perm_tags.append('<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />')
+          if perms.get("record_audio"): perm_tags.append('<uses-permission android:name="android.permission.RECORD_AUDIO" />')
+
+          perms_str = "\n    ".join(perm_tags)
+          with open(f"{project_dir}/app/src/main/AndroidManifest.xml", "w") as f:
+              f.write(f'''<?xml version="1.0" encoding="utf-8"?>
+  <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+      xmlns:tools="http://schemas.android.com/tools">
+      {perms_str}
+      <application
+          android:allowBackup="true"
+          android:icon="@mipmap/ic_launcher"
+          android:label="@string/app_name"
+          android:roundIcon="@mipmap/ic_launcher_round"
+          android:supportsRtl="true"
+          android:theme="@style/Theme.WebsiteToApp"
+          android:hardwareAccelerated="true"
+          android:usesCleartextTraffic="true"
+          tools:targetApi="34">
+          <activity
+              android:name=".MainActivity"
+              android:exported="true"
+              android:configChanges="orientation|screenSize|keyboardHidden"
+              android:windowSoftInputMode="adjustResize">
+              <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+              </intent-filter>
+          </activity>
+          <activity
+              android:name=".OnboardingActivity"
+              android:exported="false"
+              android:theme="@style/Theme.WebsiteToApp" />
+      </application>
+  </manifest>
+  ''')
+
+          # 7. Kotlin code
+          with open(f"{pkg_path}/AppConfig.kt", "w") as f:
+              f.write(f'''package {pkg_name}
+  import com.google.gson.annotations.SerializedName
+  data class AppConfig(
+      @SerializedName("app_name") val appName: String = "{app_name}",
+      @SerializedName("package_name") val packageName: String = "{pkg_name}",
+      @SerializedName("website_url") val websiteUrl: String = "{safe_url}",
+      @SerializedName("theme_color") val themeColor: String = "{theme_color}"
+  )
+  ''')
+
+          with open(f"{pkg_path}/MainActivity.kt", "w") as f:
+              f.write(f'''package {pkg_name}
+  import android.os.Bundle
+  import android.annotation.SuppressLint
+  import android.webkit.WebView
+  import android.webkit.WebViewClient
+  import android.webkit.WebChromeClient
+  import android.webkit.WebSettings
+  import androidx.appcompat.app.AppCompatActivity
+
+  class MainActivity : AppCompatActivity() {{
+      private lateinit var webView: WebView
+
+      @SuppressLint("SetJavaScriptEnabled")
+      override fun onCreate(savedInstanceState: Bundle?) {{
+          super.onCreate(savedInstanceState)
+          webView = WebView(this)
+          setContentView(webView)
+          val ws = webView.settings
+          ws.javaScriptEnabled = true
+          ws.domStorageEnabled = true
+          ws.databaseEnabled = true
+          ws.allowFileAccess = true
+          ws.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+          webView.webViewClient = WebViewClient()
+          webView.webChromeClient = WebChromeClient()
+          webView.loadUrl("{safe_url}")
+      }}
+
+      @Deprecated("Deprecated in Java")
+      override fun onBackPressed() {{
+          if (this::webView.isInitialized && webView.canGoBack()) {{
+              webView.goBack()
+          }} else {{
+              @Suppress("DEPRECATION")
+              super.onBackPressed()
+          }}
+      }}
+  }}
+  ''')
+
+          with open(f"{pkg_path}/OnboardingActivity.kt", "w") as f:
+              f.write(f'''package {pkg_name}
+  import android.os.Bundle
+  import androidx.appcompat.app.AppCompatActivity
+
+  class OnboardingActivity : AppCompatActivity() {{
+      override fun onCreate(savedInstanceState: Bundle?) {{
+          super.onCreate(savedInstanceState)
+          finish()
+      }}
+  }}
+  ''')
+
+          # 8. Resources: Escape XML strings to prevent AAPT2 XML parse errors
+          def xml_escape(val):
+              if not val:
+                  return ""
+              v = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+              v = v.replace("'", "\\'").replace('"', '\\"')
+              return v
+
+          safe_app_name = xml_escape(app_name)
+          with open(f"{project_dir}/app/src/main/res/values/strings.xml", "w", encoding="utf-8") as f:
+              f.write(f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">{safe_app_name}</string>\n</resources>\n')
+
+          with open(f"{project_dir}/app/src/main/res/values/colors.xml", "w") as f:
+              f.write(f'''<?xml version="1.0" encoding="utf-8"?>
+  <resources>
+      <color name="primary">{theme_color}</color>
+      <color name="primary_dark">{theme_color}</color>
+      <color name="accent">{theme_color}</color>
+      <color name="white">#FFFFFFFF</color>
+      <color name="black">#FF000000</color>
+  </resources>
+  ''')
+
+          with open(f"{project_dir}/app/src/main/res/values/themes.xml", "w") as f:
+              f.write('''<resources>
+      <style name="Theme.WebsiteToApp" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+          <item name="colorPrimary">@color/primary</item>
+          <item name="colorPrimaryDark">@color/primary_dark</item>
+          <item name="colorAccent">@color/accent</item>
+          <item name="android:statusBarColor">@color/primary_dark</item>
+      </style>
+  </resources>
+  ''')
+
+          # 9. Icons & Drawables: Adaptive icon XML and PNGs so AAPT2 resource resolution NEVER fails
+          with open(f"{project_dir}/app/src/main/res/drawable/ic_launcher_foreground.xml", "w") as f:
+              f.write('''<vector xmlns:android="http://schemas.android.com/apk/res/android"
+      android:width="108dp"
+      android:height="108dp"
+      android:viewportWidth="108"
+      android:viewportHeight="108">
+      <path
+          android:fillColor="#FFFFFFFF"
+          android:pathData="M34,34h40v40h-40z"/>
+  </vector>
+  ''')
+
+          with open(f"{project_dir}/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", "w") as f:
+              f.write('''<?xml version="1.0" encoding="utf-8"?>
+  <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+      <background android:drawable="@color/primary" />
+      <foreground android:drawable="@drawable/ic_launcher_foreground" />
+  </adaptive-icon>
+  ''')
+
+          with open(f"{project_dir}/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml", "w") as f:
+              f.write('''<?xml version="1.0" encoding="utf-8"?>
+  <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+      <background android:drawable="@color/primary" />
+      <foreground android:drawable="@drawable/ic_launcher_foreground" />
+  </adaptive-icon>
+  ''')
+
+          # Minimal valid 1x1 PNG bytes fallback for legacy mipmaps
+          tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+          user_icon_b64 = config.get("icon_base64", "") or config.get("icon", "")
+          icon_bytes = tiny_png
+          if user_icon_b64:
+              try:
+                  if "," in user_icon_b64:
+                      user_icon_b64 = user_icon_b64.split(",", 1)[1]
+                  icon_bytes = base64.b64decode(user_icon_b64)
+              except Exception as e:
+                  icon_bytes = tiny_png
+
+          for density in ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]:
+              folder = f"{project_dir}/app/src/main/res/mipmap-{density}"
+              os.makedirs(folder, exist_ok=True)
+              with open(f"{folder}/ic_launcher.png", "wb") as f:
+                  f.write(icon_bytes)
+              with open(f"{folder}/ic_launcher_round.png", "wb") as f:
+                  f.write(icon_bytes)
+
+          print(f"Android Kotlin project generated successfully for {app_name} ({pkg_name})")
+          EOF
+
+      - name: Generate Release Keystore
+        env:
+          KS_B64: ${{ inputs.keystore_base64 }}
+          KS_PASS: ${{ inputs.keystore_password }}
+          KEY_ALIAS: ${{ inputs.key_alias }}
+          KEY_PASS: ${{ inputs.key_password }}
+        run: |
+          mkdir -p android-project/app
+          KS_PASS="${KS_PASS:-android}"
+          if [ -z "$KS_PASS" ] || [ ${#KS_PASS} -lt 6 ]; then KS_PASS="android"; fi
+          KEY_ALIAS="${KEY_ALIAS:-androidkey}"
+          if [ -z "$KEY_ALIAS" ]; then KEY_ALIAS="androidkey"; fi
+          KEY_PASS="${KEY_PASS:-android}"
+          if [ -z "$KEY_PASS" ] || [ ${#KEY_PASS} -lt 6 ]; then KEY_PASS="android"; fi
+
+          rm -f android-project/app/release-keystore.jks android-project/release-keystore.jks
+
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > android-project/app/release-keystore.jks
+          else
+            keytool -genkeypair -v -keystore android-project/app/release-keystore.jks \
+              -alias "$KEY_ALIAS" \
+              -keypass "$KEY_PASS" \
+              -storepass "$KS_PASS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storetype PKCS12 \
+              -dname "CN=WebsiteToApp, OU=Mobile, O=WebsiteToApp, L=Global, S=Global, C=US"
+          fi
+          cp android-project/app/release-keystore.jks android-project/release-keystore.jks || true
+          cp android-project/app/release-keystore.jks ./release-keystore.jks || true
+
+      - name: Build Release APK and AAB
+        id: build_step
+        env:
+          KEYSTORE_PASSWORD: ${{ inputs.keystore_password }}
+          KEY_ALIAS: ${{ inputs.key_alias }}
+          KEY_PASSWORD: ${{ inputs.key_password }}
+        run: |
+          cd android-project
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+          KS_PASS="${KEYSTORE_PASSWORD:-android}"
+          if [ -z "$KS_PASS" ] || [ ${#KS_PASS} -lt 6 ]; then KS_PASS="android"; fi
+          K_ALIAS="${KEY_ALIAS:-androidkey}"
+          if [ -z "$K_ALIAS" ]; then K_ALIAS="androidkey"; fi
+          K_PASS="${KEY_PASSWORD:-android}"
+          if [ -z "$K_PASS" ] || [ ${#K_PASS} -lt 6 ]; then K_PASS="android"; fi
+
+          export KEYSTORE_PASSWORD="$KS_PASS"
+          export KEY_ALIAS="$K_ALIAS"
+          export KEY_PASSWORD="$K_PASS"
+
+          # Create Gradle wrapper if missing
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper --gradle-version 8.5 --distribution-type bin || true
+          fi
+          chmod +x gradlew || true
+
+          echo "=== 1. Building Release APK & AAB ==="
+          gradle assembleRelease bundleRelease --no-daemon --stacktrace || \
+          ./gradlew assembleRelease bundleRelease --no-daemon --stacktrace || \
+          gradle assembleDebug bundleRelease --no-daemon --stacktrace || \
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare Binaries
+        run: |
+          mkdir -p output
+          find android-project/app/build/outputs -name "*.apk" -exec cp {} output/ ; 2>/dev/null || true
+          find android-project/app/build/outputs -name "*.aab" -exec cp {} output/ ; 2>/dev/null || true
+
+          # Standardize filenames
+          RELEASE_APK=$(find output/ -maxdepth 1 -name "*release*.apk" | head -n 1)
+          if [ -n "$RELEASE_APK" ]; then
+            cp "$RELEASE_APK" output/app-release.apk
+          else
+            ANY_APK=$(find output/ -maxdepth 1 -name "*.apk" | head -n 1)
+            if [ -n "$ANY_APK" ]; then
+              cp "$ANY_APK" output/app-release.apk
+            fi
+          fi
+
+          RELEASE_AAB=$(find output/ -maxdepth 1 -name "*release*.aab" | head -n 1)
+          if [ -n "$RELEASE_AAB" ]; then
+            cp "$RELEASE_AAB" output/app-release.aab
+          else
+            ANY_AAB=$(find output/ -maxdepth 1 -name "*.aab" | head -n 1)
+            if [ -n "$ANY_AAB" ]; then
+              cp "$ANY_AAB" output/app-release.aab
+            fi
+          fi
+
+          if [ -f "android-project/app/release-keystore.jks" ]; then
+            cp android-project/app/release-keystore.jks output/release-keystore.jks
+          elif [ -f "android-project/release-keystore.jks" ]; then
+            cp android-project/release-keystore.jks output/release-keystore.jks
+          fi
+
+          echo "=== Binaries in output directory ==="
+          ls -la output/
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-binaries
+          path: output/*
+          if-no-files-found: warn
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: always()
+        continue-on-error: true
+        with:
+          tag_name: build-${{ github.run_id }}
+          name: App Build #${{ github.run_id }}
+          draft: false
+          prerelease: false
+          body: |
+            ## Android Build Artifacts Ready!
+            - **APK (Direct Install)**: Ready for phone / sideloading.
+            - **AAB (Android App Bundle)**: Ready for Google Play Console.
+            - **Signing Keystore**: Keystore used to sign this build.
+          fail_on_unmatched_files: false
+          files: |
+            output/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
